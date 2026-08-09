@@ -2,6 +2,8 @@ package sutel
 
 import (
 	"context"
+	"crypto/md5"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -29,15 +31,45 @@ func (s *Session) runInbound() error {
 	requestURI := sipURI(scenario.To, scenario.TargetSIPAddr)
 	contact := localContact(s.sipAddr, scenario.From)
 	localAddress := fmt.Sprintf("<%s>;tag=%s", sipURI(scenario.From, s.sipAddr), localTag)
+	if scenario.FromDisplayName != "" {
+		displayName := strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(scenario.FromDisplayName)
+		localAddress = fmt.Sprintf(`"%s" <%s>;tag=%s`, displayName, sipURI(scenario.From, s.sipAddr), localTag)
+	}
 	remoteAddress := fmt.Sprintf("<%s>", sipURI(scenario.To, scenario.TargetSIPAddr))
 	invite := sip.NewRequest("INVITE", requestURI)
 	appendRequestHeaders(invite, branch, localAddress, remoteAddress, callID, 1, contact)
 	invite.Add("Content-Type", "application/sdp")
 	invite.Body = body
 
-	final, peer, err := s.runInviteClientTransaction(invite, scenario.RingTimeout)
+	final, peer, err := s.runInviteClientTransaction(invite, scenario.RingTimeout, nil)
 	if err != nil {
 		return err
+	}
+	if final.StatusCode == 401 && scenario.DigestCredentials != nil {
+		staleACK := s.makeInviteACK(invite, final, requestURI, branch, false)
+		if err := s.sendSIP(staleACK, peer, false); err != nil {
+			return err
+		}
+		authenticated := invite.Clone()
+		branch = s.carrier.ids.Branch()
+		authenticated.Set("Via", fmt.Sprintf("SIP/2.0/UDP %s;branch=%s;rport", requestLocalHost(contact), branch))
+		authenticated.Set("CSeq", "2 INVITE")
+		authorization, err := digestAuthorization(
+			final.Values("WWW-Authenticate"), scenario.DigestCredentials.Username,
+			scenario.DigestCredentials.Password, authenticated.Method, authenticated.URI,
+			s.carrier.ids.ID("cnonce-"),
+		)
+		if err != nil {
+			return fmt.Errorf("%w: digest challenge: %v", ErrProtocol, err)
+		}
+		authenticated.Set("Authorization", authorization)
+		// The retried transaction may still observe retransmissions of the 401;
+		// staleACK re-acknowledges them so the challenge transaction completes.
+		final, peer, err = s.runInviteClientTransaction(authenticated, scenario.RingTimeout, staleACK)
+		if err != nil {
+			return err
+		}
+		invite = authenticated
 	}
 	s.setOutcome(func(outcome *SIPOutcome) { outcome.InviteFinalStatus = final.StatusCode })
 	expectedStatus := scenario.ExpectStatus
@@ -65,7 +97,7 @@ func (s *Session) runInbound() error {
 	dialog := &callDialog{
 		callID: callID, localTag: localTag, remoteTag: remoteTag,
 		localAddress: localAddress, remoteAddress: final.Get("To"), remoteTarget: remoteTarget,
-		peer: sip.RequestTarget(final, peer), inviteCSeq: 1, remoteCSeq: 0, localCSeq: 1, inviteBranch: branch,
+		peer: sip.RequestTarget(final, peer), inviteCSeq: mustCSeq(invite), remoteCSeq: 0, localCSeq: mustCSeq(invite), inviteBranch: branch,
 		invite:   invite.Clone(),
 		routeSet: routeSet(final.Values("Record-Route"), true),
 	}
@@ -159,6 +191,159 @@ func (s *Session) runInbound() error {
 	return errors.Join(dialogErr, mediaErr, byeErr)
 }
 
+// digestAuthorization answers the first supported challenge among the
+// WWW-Authenticate header values: Digest with MD5 (RFC 2617) or SHA-256
+// (RFC 7616), qop absent or auth. A server may offer several challenges with
+// different algorithms; unsupported ones are skipped.
+func digestAuthorization(challenges []string, username, password, method, uri, cnonce string) (string, error) {
+	lastErr := fmt.Errorf("missing Digest challenge")
+	for _, challenge := range challenges {
+		authorization, err := answerDigestChallenge(challenge, username, password, method, uri, cnonce)
+		if err == nil {
+			return authorization, nil
+		}
+		lastErr = err
+	}
+	return "", lastErr
+}
+
+func answerDigestChallenge(challenge, username, password, method, uri, cnonce string) (string, error) {
+	parameters, err := parseDigestChallenge(challenge)
+	if err != nil {
+		return "", err
+	}
+	realm, nonce := parameters["realm"], parameters["nonce"]
+	if realm == "" || nonce == "" {
+		return "", fmt.Errorf("missing realm or nonce")
+	}
+	algorithm, hash := "MD5", digestMD5
+	switch offered := parameters["algorithm"]; {
+	case offered == "" || strings.EqualFold(offered, "MD5"):
+	case strings.EqualFold(offered, "SHA-256"):
+		algorithm, hash = "SHA-256", digestSHA256
+	default:
+		return "", fmt.Errorf("unsupported algorithm %q", parameters["algorithm"])
+	}
+	ha1 := hash(username + ":" + realm + ":" + password)
+	ha2 := hash(method + ":" + uri)
+	qop := ""
+	if offered := parameters["qop"]; offered != "" {
+		for _, candidate := range strings.Split(offered, ",") {
+			if strings.EqualFold(strings.TrimSpace(candidate), "auth") {
+				qop = "auth"
+				break
+			}
+		}
+		if qop == "" {
+			return "", fmt.Errorf("qop auth is not offered")
+		}
+	}
+	nc := "00000001"
+	responseInput := ha1 + ":" + nonce + ":" + ha2
+	if qop != "" {
+		responseInput = ha1 + ":" + nonce + ":" + nc + ":" + cnonce + ":" + qop + ":" + ha2
+	}
+	parts := []string{
+		`Digest username="` + quoteDigestValue(username) + `"`,
+		`realm="` + quoteDigestValue(realm) + `"`,
+		`nonce="` + quoteDigestValue(nonce) + `"`,
+		`uri="` + quoteDigestValue(uri) + `"`,
+		`response="` + hash(responseInput) + `"`,
+		"algorithm=" + algorithm,
+	}
+	if opaque := parameters["opaque"]; opaque != "" {
+		parts = append(parts, `opaque="`+quoteDigestValue(opaque)+`"`)
+	}
+	if qop != "" {
+		parts = append(parts, "qop=auth", "nc="+nc, `cnonce="`+quoteDigestValue(cnonce)+`"`)
+	}
+	return strings.Join(parts, ", "), nil
+}
+
+func digestMD5(value string) string {
+	sum := md5.Sum([]byte(value))
+	return fmt.Sprintf("%x", sum)
+}
+
+func digestSHA256(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return fmt.Sprintf("%x", sum)
+}
+
+func quoteDigestValue(value string) string {
+	return strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(value)
+}
+
+func parseDigestChallenge(value string) (map[string]string, error) {
+	value = strings.TrimSpace(value)
+	schemeEnd := strings.IndexAny(value, " \t")
+	if schemeEnd < 0 || !strings.EqualFold(value[:schemeEnd], "Digest") {
+		return nil, fmt.Errorf("unsupported challenge %q", value)
+	}
+	rest := strings.TrimSpace(value[schemeEnd:])
+	parameters := map[string]string{}
+	for _, field := range splitDigestFields(rest) {
+		name, raw, ok := strings.Cut(field, "=")
+		if !ok {
+			return nil, fmt.Errorf("malformed digest parameter %q", field)
+		}
+		name, raw = strings.ToLower(strings.TrimSpace(name)), strings.TrimSpace(raw)
+		if len(raw) >= 2 && raw[0] == '"' && raw[len(raw)-1] == '"' {
+			raw = unescapeDigestValue(raw[1 : len(raw)-1])
+		}
+		if _, duplicate := parameters[name]; duplicate {
+			return nil, fmt.Errorf("duplicate digest parameter %q", name)
+		}
+		parameters[name] = raw
+	}
+	return parameters, nil
+}
+
+func unescapeDigestValue(value string) string {
+	var result strings.Builder
+	escaped := false
+	for index := 0; index < len(value); index++ {
+		character := value[index]
+		if !escaped && character == '\\' {
+			escaped = true
+			continue
+		}
+		escaped = false
+		result.WriteByte(character)
+	}
+	return result.String()
+}
+
+func splitDigestFields(value string) []string {
+	var fields []string
+	start, quoted, escaped := 0, false, false
+	for index := 0; index < len(value); index++ {
+		character := value[index]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if quoted && character == '\\' {
+			escaped = true
+			continue
+		}
+		if character == '"' {
+			quoted = !quoted
+			continue
+		}
+		if character == ',' && !quoted {
+			if field := strings.TrimSpace(value[start:index]); field != "" {
+				fields = append(fields, field)
+			}
+			start = index + 1
+		}
+	}
+	if field := strings.TrimSpace(value[start:]); field != "" {
+		fields = append(fields, field)
+	}
+	return fields
+}
+
 func (s *Session) failEstablishedInbound(dialog *callDialog, cause error) error {
 	byeErr := s.sendDialogBYEOnce(dialog)
 	if byeErr == nil {
@@ -198,7 +383,7 @@ func (s *Session) absorbNon2xxFinal(invite, ack *sip.Message) error {
 	}
 }
 
-func (s *Session) runInviteClientTransaction(invite *sip.Message, ringTimeout time.Duration) (*sip.Message, netip.AddrPort, error) {
+func (s *Session) runInviteClientTransaction(invite *sip.Message, ringTimeout time.Duration, staleACK *sip.Message) (*sip.Message, netip.AddrPort, error) {
 	if err := s.sendSIP(invite, s.inbound.TargetSIPAddr, false); err != nil {
 		return nil, netip.AddrPort{}, err
 	}
@@ -232,6 +417,16 @@ func (s *Session) runInviteClientTransaction(invite *sip.Message, ringTimeout ti
 		}
 		if message.IsRequest() {
 			s.ignoreMessage()
+			continue
+		}
+		// Khi retry INVITE sau 401, transaction cũ có thể retransmit challenge
+		// trước khi nhận ACK. ACK lại đúng CSeq/branch cũ và tiếp tục chờ response
+		// của INVITE authenticated thay vì coi 401 cũ là response hiện tại.
+		if staleACK != nil && message.StatusCode == 401 &&
+			isMatching(message, callID, mustCSeq(staleACK), "INVITE") {
+			if err := s.sendSIP(staleACK, peer, true); err != nil {
+				return nil, netip.AddrPort{}, err
+			}
 			continue
 		}
 		if !isMatching(message, callID, cseq, "INVITE") {

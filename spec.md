@@ -136,14 +136,15 @@ connection.
 
 SIP transport: `UDP` only
 
-SIP trunk trust model: `trusted IP; no REGISTER or authentication`
+SIP trunk trust model: `trusted IP by default`. As UAS, Sutel never
+challenges requests. As UAC, an inbound scenario may optionally answer a
+`401` Digest challenge (section 20.1); there is no REGISTER support.
 
 The following are not required in V1:
 
 ```text
 TCP or TLS SIP
 SRTP
-Digest authentication
 REGISTER
 DNS discovery
 NAT traversal
@@ -782,8 +783,11 @@ type InboundScenario struct {
 
     TargetSIPAddr netip.AddrPort
 
-    From string
-    To   string
+    From            string
+    To              string
+    FromDisplayName string
+
+    DigestCredentials *DigestCredentials
 
     Codec Codec
 
@@ -829,6 +833,38 @@ establishment unless an explicit early-media scenario says otherwise.
 `Playback` is audio sent from Sutel to the SUT. `ExpectAudio` is audio expected
 from the SUT and verified after media drain. Both may be configured for a
 full-duplex call.
+
+### 20.1 Digest authentication (UAC only)
+
+```go
+type DigestCredentials struct {
+    Username string
+    Password string
+}
+```
+
+A nil `DigestCredentials` keeps the trusted-IP trunk model. When set and the
+INVITE receives `401`, Sutel ACKs the challenge transaction and retries the
+INVITE exactly once with an `Authorization` header:
+
+* challenges are read from every `WWW-Authenticate` value; the first
+  supported one wins and unsupported algorithms are skipped
+* supported: `MD5` (RFC 2617) and `SHA-256` (RFC 7616), `qop` absent or
+  `auth`; `opaque` is echoed back
+* the retried INVITE uses a new branch and the next CSeq; the dialog and all
+  later in-dialog requests continue from that CSeq
+* retransmissions of the `401` during the retry are re-ACKed
+* a second `401` is not retried again; it is compared against
+  `ExpectStatus` like any other final response
+* `ExpectStatus == 401` combined with credentials is an invalid scenario:
+  the 401 is consumed by the retry
+* `407 Proxy-Authenticate` is outside scope; Sutel is a direct trunk
+  endpoint
+* each INVITE transaction gets its own `RingTimeout`, so a challenged call
+  may ring for up to twice `RingTimeout`, still capped by the session
+  deadline
+
+Sutel as UAS never challenges requests, and there is no REGISTER support.
 
 ---
 
@@ -1446,6 +1482,7 @@ calls.
 9. expected non-2xx final status succeeds; a mismatched status fails
 10. SUT sends expected WAV audio to Sutel
 11. simultaneous playback and expected receive audio
+12. 401 Digest challenge answered and retried once; second 401 not retried
 ```
 
 ### DTMF
@@ -1627,7 +1664,7 @@ Do not implement these in V1:
 ```text
 a reusable/full RFC3261 stack
 SIP proxy or registrar
-REGISTER or Digest authentication
+REGISTER; challenging requests as UAS; proxy (407) authentication
 TCP, TLS, or WebSocket SIP
 SRTP
 DNS routing

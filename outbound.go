@@ -146,6 +146,9 @@ func (s *Session) validateInvite(message *sip.Message, peer netip.AddrPort) (sip
 	if expected := s.outbound.From; expected != "" && from.URI.User != expected {
 		return sip.SDP{}, nil, 404, fmt.Errorf("%w: From number got %q, want %q", ErrVerification, from.URI.User, expected)
 	}
+	if expected := s.outbound.FromDisplayName; expected != "" && from.DisplayName != expected {
+		return sip.SDP{}, nil, 404, fmt.Errorf("%w: From display name got %q, want %q", ErrVerification, from.DisplayName, expected)
+	}
 	if expected := s.outbound.To; expected != "" && to.URI.User != expected {
 		return sip.SDP{}, nil, 404, fmt.Errorf("%w: To number got %q, want %q", ErrVerification, to.URI.User, expected)
 	}

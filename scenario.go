@@ -134,6 +134,9 @@ type OutboundScenario struct {
 	// parts of both the To URI and Request-URI. An empty value skips the check.
 	From string
 	To   string
+	// FromDisplayName matches the display name in the From header exactly. An
+	// empty value skips the check.
+	FromDisplayName string
 
 	Behavior OutboundBehavior
 	Codecs   []Codec
@@ -238,6 +241,13 @@ type InboundScenario struct {
 
 	From string
 	To   string
+	// FromDisplayName is emitted in the caller's SIP From header.
+	FromDisplayName string
+
+	// DigestCredentials makes the simulated caller retry an INVITE challenged
+	// with 401 using RFC 7616 Digest authentication. Leave nil for carrier
+	// trunks that authenticate by source IP.
+	DigestCredentials *DigestCredentials
 
 	Codec Codec
 
@@ -252,12 +262,29 @@ type InboundScenario struct {
 	CallDuration time.Duration
 }
 
+type DigestCredentials struct {
+	Username string
+	Password string
+}
+
 func (s InboundScenario) validate() error {
 	if !s.TargetSIPAddr.IsValid() {
 		return fmt.Errorf("TargetSIPAddr is required")
 	}
 	if s.From == "" || s.To == "" || strings.ContainsAny(s.From+s.To, "\r\n<>@; ") {
 		return fmt.Errorf("From and To are required")
+	}
+	if strings.ContainsAny(s.FromDisplayName, "\r\n") {
+		return fmt.Errorf("FromDisplayName contains CR or LF")
+	}
+	if s.DigestCredentials != nil {
+		if s.DigestCredentials.Username == "" || strings.ContainsAny(s.DigestCredentials.Username, "\r\n\"") ||
+			strings.ContainsAny(s.DigestCredentials.Password, "\r\n") {
+			return fmt.Errorf("DigestCredentials contains invalid username or password")
+		}
+		if s.ExpectStatus == 401 {
+			return fmt.Errorf("ExpectStatus 401 conflicts with DigestCredentials: the 401 is consumed by the authentication retry")
+		}
 	}
 	if s.Codec != PCMA && s.Codec != PCMU {
 		return fmt.Errorf("unsupported codec %d", s.Codec)

@@ -359,6 +359,36 @@ socket/goroutine. `Wait()` trả thành công với `Outcome.Established == true
 `Outcome.TerminatedBy == NoParty`; test tự kiểm tra timeout, reconnect hoặc
 recovery behavior của client.
 
+### Gọi inbound qua trunk yêu cầu Digest authentication
+
+Mặc định Sutel theo mô hình trusted-IP. Nếu SUT challenge INVITE bằng `401`,
+khai báo credentials để Sutel ACK challenge rồi retry INVITE đúng một lần với
+header `Authorization`:
+
+```go
+call, err := sutel.Call(
+    context.Background(),
+    sutel.InboundScenario{
+        TargetSIPAddr: sutAddr,
+        From:          "0912345678",
+        To:            "100",
+        Codec:         sutel.PCMA,
+        DigestCredentials: &sutel.DigestCredentials{
+            Username: "trunk-user",
+            Password: "trunk-secret",
+        },
+    },
+)
+```
+
+Hỗ trợ Digest MD5 (RFC 2617) và SHA-256 (RFC 7616), `qop` vắng mặt hoặc
+`auth`; server gửi nhiều challenge thì Sutel chọn challenge đầu tiên dùng
+thuật toán hỗ trợ. `401` lần thứ hai không được retry tiếp mà so với
+`ExpectStatus` như mọi final response khác. `407` (proxy authentication) nằm
+ngoài phạm vi vì Sutel là trunk endpoint trực tiếp. Lưu ý mỗi transaction có
+`RingTimeout` riêng nên cuộc gọi bị challenge có thể chờ tới hai lần
+`RingTimeout` (vẫn bị chặn bởi `Timeout` tổng).
+
 ### Gọi inbound và phát audio vào SUT
 
 ```go

@@ -196,7 +196,29 @@ func align(expected, received []float64, maximum time.Duration) (int, error) {
 	if math.IsInf(bestScore, -1) || math.IsNaN(bestScore) {
 		return 0, ErrNoActiveAudio
 	}
-	return bestOffset * hop, nil
+	return refineAlignment(expected, received, bestOffset*hop, hop), nil
+}
+
+// refineAlignment searches one hop around the coarse grid offset at
+// one-sample resolution. A constant sub-grid delay — for example the ~6.5 ms
+// Opus codec lookahead — otherwise destroys waveform correlation even though
+// the audio is correct. Scoring is unchanged; this only aligns better.
+func refineAlignment(expected, received []float64, coarse, hop int) int {
+	bestOffset := coarse
+	bestScore := math.Inf(-1)
+	for delta := -hop; delta <= hop; delta++ {
+		offset := coarse + delta
+		score := sampledCorrelation(expected, received, offset, 1)
+		better := score > bestScore+1e-12
+		tie := math.Abs(score-bestScore) <= 1e-12 &&
+			(abs(offset-coarse) < abs(bestOffset-coarse) ||
+				abs(offset-coarse) == abs(bestOffset-coarse) && offset < bestOffset)
+		if better || tie {
+			bestScore = score
+			bestOffset = offset
+		}
+	}
+	return bestOffset
 }
 
 func sampledCorrelation(expected, received []float64, offset, stride int) float64 {

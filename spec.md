@@ -1216,7 +1216,10 @@ silence threshold in `[-96,0)` dBFS; durations greater than zero.
 
 Do not compare encoded bytes or unaligned PCM sample-by-sample. Matching must
 tolerate initial silence, startup delay, modest gain differences, deterministic
-resampling differences, and G.711 quantization.
+resampling differences, and G.711 quantization. `VerifyAudio` input may come
+from a SUT whose own receive path decoded a lossy codec Sutel does not
+negotiate: matching must also tolerate Opus-at-VoIP-bitrate quantization and
+the constant sub-grid decoder lookahead delay such a capture carries.
 
 ---
 
@@ -1246,7 +1249,10 @@ SilenceThresholdDBFS  = -45.0
 
 Alignment searches within `[-MaxAlignmentOffset,+MaxAlignmentOffset]`. A
 positive offset means matching content starts later in received audio. The
-search grid is 10 ms. The
+search grid is 10 ms, followed by a deterministic one-sample refinement
+within one grid step so a constant sub-grid delay — for example the ~6.5 ms
+codec lookahead left in audio a SUT decoded from an Opus stream — cannot
+destroy waveform correlation. The
 alignment method must use signal content as well as a short-time energy
 envelope so periodic material does not select a high-energy but phase-wrong
 offset. Ties choose the smallest absolute offset, then the earlier offset.
@@ -1551,6 +1557,8 @@ extra prefix/suffix
 periodic audio alignment
 no comparable windows
 silence threshold boundary
+sub-grid constant delay (Opus lookahead shape) aligned by refinement
+Opus-degraded capture fixture through VerifyAudio
 provided testdata/sample.wav through WAV -> G.711 -> RTP -> match
 ```
 

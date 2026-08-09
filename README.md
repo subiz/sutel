@@ -212,6 +212,12 @@ coverage cùng threshold như `ExpectAudio`. Khi threshold không đạt, hàm v
 trả metrics và lỗi tương thích với
 `errors.Is(err, sutel.ErrVerification)`.
 
+Sutel không negotiate Opus trong call, nhưng `VerifyAudio` hoạt động tốt với
+audio mà SUT đã decode từ stream Opus của carrier thật: bộ so khớp chịu được
+quantization của Opus ở bitrate VoIP lẫn độ trễ lookahead (~6.5 ms) mà
+decoder để lại trong bản thu. Với audio đi qua Opus, ngưỡng khuyến nghị là
+`MinSimilarity: 0.90`, `MinCoverage: 0.95`.
+
 ### Echo audio của SUT sau một khoảng trễ
 
 Trường hợp cần kiểm tra SUT gửi microphone và nhận lại chính audio đó sau 3

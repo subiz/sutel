@@ -79,6 +79,27 @@ func TestMatchNoComparableWindowsIsFiniteZero(t *testing.T) {
 	}
 }
 
+// A constant delay that is not a multiple of the 10 ms coarse grid — for
+// example the ~6.5 ms (52-sample) Opus codec lookahead left in audio a SUT
+// decoded from an Opus stream — must be absorbed by the one-sample alignment
+// refinement instead of destroying waveform correlation.
+func TestMatchAlignsSubGridConstantDelay(t *testing.T) {
+	expected := testSignal(3 * 8000)
+	for _, delay := range []int{52, 26, 186} {
+		received := append(make([]int16, delay), expected...)
+		result, err := Match(expected, received, MatchOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Similarity < 0.99 || result.Coverage < 0.99 {
+			t.Fatalf("delay=%d samples: %+v", delay, result)
+		}
+		if want := time.Duration(delay) * time.Second / 8000; result.AlignmentOffset != want {
+			t.Fatalf("delay=%d samples: offset=%s want %s", delay, result.AlignmentOffset, want)
+		}
+	}
+}
+
 func TestMatchRejectsWrongAudio(t *testing.T) {
 	expected := testSignal(3 * 8000)
 	wrong := make([]int16, len(expected))

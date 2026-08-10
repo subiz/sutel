@@ -394,11 +394,39 @@ func (s *Session) runInviteClientTransaction(invite *sip.Message, ringTimeout ti
 	defer stopTransactionTimer(deadlineTimer)
 	retransmitTimer := s.carrier.clock.NewTimer(interval)
 	defer func() { stopTransactionTimer(retransmitTimer) }()
+
+	// CancelAfter: khách cúp khi đang đổ chuông. Timer chan (time.Time) chuyển
+	// thành chan struct{} cho slot localHangup của readSIPWithTimers.
+	var cancelCh chan struct{}
+	if s.inbound.CancelAfter > 0 {
+		cancelTimer := s.carrier.clock.NewTimer(s.inbound.CancelAfter)
+		defer stopTransactionTimer(cancelTimer)
+		ch := make(chan struct{})
+		cancelCh = ch
+		go func() {
+			select {
+			case <-timerChannel(cancelTimer):
+				close(ch)
+			case <-s.ctx.Done():
+			}
+		}()
+	}
+
 	provisional := false
 	for {
-		message, peer, timeout, err := s.readSIPWithTimers(s.ctx, timerChannel(retransmitTimer), timerChannel(deadlineTimer), nil)
+		message, peer, timeout, err := s.readSIPWithTimers(s.ctx, timerChannel(retransmitTimer), timerChannel(deadlineTimer), cancelCh)
 		if err != nil {
 			return nil, netip.AddrPort{}, err
+		}
+		if timeout == localHangupSIPReadTimeout {
+			// Cúp chủ động khi chưa có final: gửi CANCEL rồi TIẾP TỤC chờ 487
+			// final của INVITE (đường non-2xx phía caller sẽ ACK nó như thường).
+			cancelCh = nil
+			s.setOutcome(func(outcome *SIPOutcome) { outcome.Canceled = true })
+			if err := s.sendSIP(makeCancelRequest(invite), s.inbound.TargetSIPAddr, false); err != nil {
+				return nil, netip.AddrPort{}, err
+			}
+			continue
 		}
 		if timeout == deadlineSIPReadTimeout {
 			if provisional {
@@ -445,10 +473,23 @@ func (s *Session) runInviteClientTransaction(invite *sip.Message, ringTimeout ti
 	}
 }
 
-func (s *Session) cancelTimedOutInvite(invite *sip.Message) error {
+// makeCancelRequest dựng CANCEL cho một INVITE chưa có final. RFC 3261 §9.1:
+// Via của CANCEL phải Y HỆT Via của INVITE (cùng branch VÀ sent-by host:port) —
+// UAS match transaction bằng (branch, via host, via port); dựng lại Via bằng
+// appendRequestHeaders với contact rỗng sẽ ra "127.0.0.1" không port -> trượt.
+func makeCancelRequest(invite *sip.Message) *sip.Message {
 	cancel := sip.NewRequest("CANCEL", invite.URI)
-	appendRequestHeaders(cancel, sip.ViaBranch(invite.Get("Via")), invite.Get("From"), invite.Get("To"), invite.Get("Call-ID"), mustCSeq(invite), "")
-	if err := s.sendSIP(cancel, s.inbound.TargetSIPAddr, false); err != nil {
+	cancel.Add("Via", invite.Get("Via"))
+	cancel.Add("Max-Forwards", "70")
+	cancel.Add("From", invite.Get("From"))
+	cancel.Add("To", invite.Get("To"))
+	cancel.Add("Call-ID", invite.Get("Call-ID"))
+	cancel.Add("CSeq", fmt.Sprintf("%d CANCEL", mustCSeq(invite)))
+	return cancel
+}
+
+func (s *Session) cancelTimedOutInvite(invite *sip.Message) error {
+	if err := s.sendSIP(makeCancelRequest(invite), s.inbound.TargetSIPAddr, false); err != nil {
 		return err
 	}
 	timer := s.carrier.clock.NewTimer(min(2*s.carrier.config.SIPT1, s.carrier.config.SIPT2))

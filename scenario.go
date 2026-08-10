@@ -260,6 +260,12 @@ type InboundScenario struct {
 
 	RingTimeout  time.Duration
 	CallDuration time.Duration
+
+	// CancelAfter sends CANCEL if no final response arrived within the given
+	// duration after INVITE — simulating a caller abandoning while ringing
+	// (deferred-answer callees never send 200 until an agent picks up). The
+	// session then waits for the 487 final; pair with ExpectStatus: 487.
+	CancelAfter time.Duration
 }
 
 type DigestCredentials struct {
